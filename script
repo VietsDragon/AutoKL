@@ -1,0 +1,2425 @@
+// ==UserScript==
+// @name         Auto KL M2
+// @namespace    medinet-auto-kl-m2
+// @version      1.0
+// @description  Tự động xử lý hàng loạt tab Kết luận cho mẫu M2 (trẻ dưới 18 tuổi) - quét qua danh sách "chưa kết luận", tự chọn Bình thường / Khác + chuyên khoa theo mã ICD, hoặc dừng lại báo ca khó.
+// @author       Trần Xuân Cường
+// @match        https://quanlyskcd.medinet.org.vn/*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // =========================================================
+    // CẤU HÌNH
+    // =========================================================
+
+    const LOG = '[AUTO KL M2]';
+
+    const STORAGE_ACTIVE_KEY = 'medinet_kl_m2_batch_active';
+    const STORAGE_COUNT_KEY = 'medinet_kl_m2_batch_count';
+    const STORAGE_SKIP_INDEX_KEY = 'medinet_kl_m2_skip_index';
+    const STORAGE_SKIPPED_LIST_KEY = 'medinet_kl_m2_skipped_list';
+
+
+    // =========================================================
+    // HÀM CƠ BẢN
+    // =========================================================
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function norm(text) {
+        return (text || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    function log(...args) {
+        console.log(LOG, ...args);
+    }
+
+    function warn(...args) {
+        console.warn(LOG, ...args);
+    }
+
+    function fastClick(el) {
+
+        if (!el) {
+            return false;
+        }
+
+        try {
+
+            el.click();
+
+            return true;
+
+        } catch (e) {
+
+            warn(
+                'Lỗi click:',
+                e
+            );
+
+            return false;
+        }
+    }
+
+    // Click đầy đủ chuỗi sự kiện (cho DevExtreme) - giống
+    // script Auto M3/M4, cần cho checkbox DevExtreme
+    function robustClick(el) {
+
+        if (!el) {
+            return false;
+        }
+
+        try {
+
+            const rect =
+                el.getBoundingClientRect();
+
+            const x =
+                rect.left + rect.width / 2;
+
+            const y =
+                rect.top + rect.height / 2;
+
+            const base = {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: window,
+                clientX: x,
+                clientY: y
+            };
+
+            const pointerOpts = {
+                ...base,
+                pointerId: 1,
+                pointerType: 'mouse',
+                isPrimary: true
+            };
+
+            const sequence = [
+                () => new PointerEvent('pointerdown', pointerOpts),
+                () => new MouseEvent('mousedown', base),
+                () => new PointerEvent('pointerup', pointerOpts),
+                () => new MouseEvent('mouseup', base),
+                () => new MouseEvent('click', base)
+            ];
+
+            for (
+                const makeEvent of sequence
+            ) {
+
+                el.dispatchEvent(
+                    makeEvent()
+                );
+            }
+
+            return true;
+
+        } catch (e) {
+
+            warn(
+                'Lỗi robustClick, dùng click thường:',
+                e
+            );
+
+            return fastClick(el);
+        }
+    }
+
+
+    // =========================================================
+    // GIAO DIỆN MODAL (rút gọn từ Auto M3/M4, giữ phong cách
+    // đồng nhất)
+    // =========================================================
+
+    function ensureModalStyles() {
+
+        if (
+            document.getElementById(
+                'klm2-modal-style'
+            )
+        ) {
+
+            return;
+        }
+
+        const style =
+            document.createElement(
+                'style'
+            );
+
+        style.id =
+            'klm2-modal-style';
+
+        style.textContent = `
+            .klm2-overlay {
+                position: fixed;
+                inset: 0;
+                background: rgba(15, 23, 42, 0.55);
+                z-index: 9999999;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+            }
+            .klm2-box {
+                background: #fff;
+                border-radius: 14px;
+                width: min(480px, 92vw);
+                max-height: 82vh;
+                display: flex;
+                flex-direction: column;
+                box-shadow: 0 20px 50px rgba(0,0,0,.35);
+                overflow: hidden;
+            }
+            .klm2-header {
+                padding: 18px 22px;
+                font-size: 16px;
+                font-weight: 700;
+                color: #0f172a;
+                border-bottom: 1px solid #eef0f3;
+            }
+            .klm2-header.warn { color: #b45309; }
+            .klm2-header.ok { color: #15803d; }
+            .klm2-body {
+                padding: 18px 22px;
+                font-size: 13.5px;
+                color: #334155;
+                line-height: 1.6;
+                overflow-y: auto;
+            }
+            .klm2-note {
+                margin-top: 12px;
+                font-size: 12px;
+                color: #94a3b8;
+                font-style: italic;
+            }
+            .klm2-footer {
+                padding: 14px 22px;
+                border-top: 1px solid #eef0f3;
+                display: flex;
+                justify-content: flex-end;
+                gap: 10px;
+                background: #fafafa;
+            }
+            .klm2-btn {
+                padding: 9px 18px;
+                border-radius: 8px;
+                border: none;
+                font-size: 13.5px;
+                font-weight: 600;
+                cursor: pointer;
+            }
+            .klm2-btn-primary { background: #2563eb; color: #fff; }
+            .klm2-btn-secondary { background: #e5e7eb; color: #334155; }
+            .klm2-toast {
+                position: fixed;
+                left: 50%;
+                bottom: 40px;
+                transform: translateX(-50%) translateY(20px);
+                background: #15803d;
+                color: #fff;
+                padding: 13px 22px;
+                border-radius: 10px;
+                font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+                font-size: 14px;
+                font-weight: 600;
+                box-shadow: 0 10px 30px rgba(0,0,0,.25);
+                z-index: 9999999;
+                opacity: 0;
+                transition: opacity .25s, transform .25s;
+            }
+            .klm2-toast.show {
+                opacity: 1;
+                transform: translateX(-50%) translateY(0);
+            }
+            .klm2-toolbar-btn {
+                transition: transform .12s ease, filter .12s ease;
+            }
+            .klm2-toolbar-btn:hover {
+                transform: translateY(-2px);
+                filter: brightness(1.08);
+            }
+            #klm2-status-bar {
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                z-index: 9999999;
+                background: #92400e;
+                color: #fff;
+                font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+                font-size: 13.5px;
+                font-weight: 600;
+                text-align: center;
+                padding: 9px 16px;
+                box-shadow: 0 2px 10px rgba(0,0,0,.3);
+                display: none;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+            }
+            #klm2-status-bar .klm2-spin {
+                display: inline-block;
+                width: 13px;
+                height: 13px;
+                border: 2px solid rgba(255,255,255,.35);
+                border-top-color: #fff;
+                border-radius: 50%;
+                animation: klm2-spin-anim .7s linear infinite;
+            }
+            @keyframes klm2-spin-anim {
+                to { transform: rotate(360deg); }
+            }
+        `;
+
+        document.head.appendChild(
+            style
+        );
+    }
+
+    function showStatusBar(message) {
+
+        ensureModalStyles();
+
+        let bar =
+            document.getElementById(
+                'klm2-status-bar'
+            );
+
+        if (!bar) {
+
+            bar =
+                document.createElement('div');
+
+            bar.id = 'klm2-status-bar';
+
+            document.body.appendChild(bar);
+        }
+
+        bar.innerHTML =
+            '<span class="klm2-spin"></span>' +
+            '<span>' + message + '</span>';
+
+        bar.style.display = 'flex';
+    }
+
+    function hideStatusBar() {
+
+        const bar =
+            document.getElementById(
+                'klm2-status-bar'
+            );
+
+        if (bar) {
+
+            bar.style.display = 'none';
+        }
+    }
+
+    function updateStatusBar(message) {
+
+        showStatusBar(message);
+    }
+
+    function showModal(
+        { title, titleClass, bodyHtml, buttons }
+    ) {
+
+        ensureModalStyles();
+
+        return new Promise(
+            resolve => {
+
+                const overlay =
+                    document.createElement(
+                        'div'
+                    );
+
+                overlay.className =
+                    'klm2-overlay';
+
+                const box =
+                    document.createElement(
+                        'div'
+                    );
+
+                box.className =
+                    'klm2-box';
+
+                const header =
+                    document.createElement(
+                        'div'
+                    );
+
+                header.className =
+                    'klm2-header' +
+                    (
+                        titleClass
+                            ? (' ' + titleClass)
+                            : ''
+                    );
+
+                header.textContent =
+                    title;
+
+                const body =
+                    document.createElement(
+                        'div'
+                    );
+
+                body.className =
+                    'klm2-body';
+
+                body.innerHTML =
+                    bodyHtml;
+
+                const footer =
+                    document.createElement(
+                        'div'
+                    );
+
+                footer.className =
+                    'klm2-footer';
+
+                buttons.forEach(
+                    btn => {
+
+                        const b =
+                            document.createElement(
+                                'button'
+                            );
+
+                        b.className =
+                            'klm2-btn ' +
+                            (
+                                btn.primary
+                                    ? 'klm2-btn-primary'
+                                    : 'klm2-btn-secondary'
+                            );
+
+                        b.textContent =
+                            btn.label;
+
+                        b.addEventListener(
+                            'click',
+                            () => {
+
+                                document.body.removeChild(
+                                    overlay
+                                );
+
+                                resolve(
+                                    btn.value
+                                );
+                            }
+                        );
+
+                        footer.appendChild(
+                            b
+                        );
+                    }
+                );
+
+                box.appendChild(header);
+                box.appendChild(body);
+                box.appendChild(footer);
+                overlay.appendChild(box);
+                document.body.appendChild(overlay);
+            }
+        );
+    }
+
+    function infoModal(
+        title,
+        bodyHtml,
+        titleClass
+    ) {
+
+        return showModal({
+            title,
+            titleClass,
+            bodyHtml,
+            buttons: [
+                { label: 'Đóng', value: true, primary: true }
+            ]
+        });
+    }
+
+    function confirmModal(
+        title,
+        bodyHtml,
+        titleClass
+    ) {
+
+        return showModal({
+            title,
+            titleClass,
+            bodyHtml,
+            buttons: [
+                { label: 'Huỷ', value: false },
+                { label: 'Xác nhận', value: true, primary: true }
+            ]
+        });
+    }
+
+    function showToast(
+        message,
+        durationMs
+    ) {
+
+        ensureModalStyles();
+
+        const toast =
+            document.createElement(
+                'div'
+            );
+
+        toast.className =
+            'klm2-toast';
+
+        toast.textContent =
+            message;
+
+        document.body.appendChild(
+            toast
+        );
+
+        requestAnimationFrame(
+            () => {
+
+                toast.classList.add(
+                    'show'
+                );
+            }
+        );
+
+        setTimeout(
+            () => {
+
+                toast.classList.remove(
+                    'show'
+                );
+
+                setTimeout(
+                    () => {
+
+                        if (toast.parentNode) {
+
+                            toast.parentNode.removeChild(
+                                toast
+                            );
+                        }
+                    },
+                    300
+                );
+            },
+            durationMs || 3000
+        );
+    }
+
+
+    // =========================================================
+    // TRẠNG THÁI CHẠY HÀNG LOẠT (localStorage - sống sót qua
+    // các lần tải trang, vì luồng này điều hướng Danh sách <->
+    // Chi tiết liên tục, mỗi lần là 1 lần script chạy lại từ
+    // đầu)
+    // =========================================================
+
+    function isBatchActive() {
+
+        return (
+            localStorage.getItem(
+                STORAGE_ACTIVE_KEY
+            ) === '1'
+        );
+    }
+
+    function setBatchActive(active) {
+
+        if (active) {
+
+            localStorage.setItem(
+                STORAGE_ACTIVE_KEY,
+                '1'
+            );
+
+        } else {
+
+            localStorage.removeItem(
+                STORAGE_ACTIVE_KEY
+            );
+        }
+    }
+
+    function getBatchCount() {
+
+        return parseInt(
+            localStorage.getItem(
+                STORAGE_COUNT_KEY
+            ) || '0',
+            10
+        );
+    }
+
+    function incBatchCount() {
+
+        localStorage.setItem(
+            STORAGE_COUNT_KEY,
+            String(
+                getBatchCount() + 1
+            )
+        );
+    }
+
+    function resetBatchCount() {
+
+        localStorage.removeItem(
+            STORAGE_COUNT_KEY
+        );
+    }
+
+
+    // -----------------------------------------------------------
+    // "VỊ TRÍ BỎ QUA" - đếm số ca liên tiếp ở ĐẦU danh sách đã
+    // bị bỏ qua (quá khó, chưa xử lý được) trong phiên chạy
+    // này. Ca bỏ qua KHÔNG lưu gì nên vẫn còn nguyên trong danh
+    // sách "chưa kết luận" - lần tải lại danh sách vẫn thấy nó
+    // ở đầu, nên cần biết để bấm đúng dòng tiếp theo (bỏ qua
+    // đúng số dòng đã biết là khó), thay vì luôn bấm dòng đầu.
+    // -----------------------------------------------------------
+
+    function getSkipIndex() {
+
+        return parseInt(
+            localStorage.getItem(
+                STORAGE_SKIP_INDEX_KEY
+            ) || '0',
+            10
+        );
+    }
+
+    function incSkipIndex() {
+
+        localStorage.setItem(
+            STORAGE_SKIP_INDEX_KEY,
+            String(
+                getSkipIndex() + 1
+            )
+        );
+    }
+
+    function resetSkipIndex() {
+
+        localStorage.removeItem(
+            STORAGE_SKIP_INDEX_KEY
+        );
+    }
+
+    function getSkippedList() {
+
+        try {
+
+            return JSON.parse(
+                localStorage.getItem(
+                    STORAGE_SKIPPED_LIST_KEY
+                ) || '[]'
+            );
+
+        } catch (e) {
+
+            return [];
+        }
+    }
+
+    function addToSkippedList(entry) {
+
+        const list =
+            getSkippedList();
+
+        list.push(entry);
+
+        localStorage.setItem(
+            STORAGE_SKIPPED_LIST_KEY,
+            JSON.stringify(list)
+        );
+    }
+
+    function resetSkippedList() {
+
+        localStorage.removeItem(
+            STORAGE_SKIPPED_LIST_KEY
+        );
+    }
+
+
+    // =========================================================
+    // CHỜ PHẦN TỬ XUẤT HIỆN (chủ động, không sleep cố định)
+    // =========================================================
+
+    async function waitForElement(
+        selectorFn,
+        timeoutMs
+    ) {
+
+        const start =
+            Date.now();
+
+        while (
+            Date.now() - start < (timeoutMs || 5000)
+        ) {
+
+            const el =
+                selectorFn();
+
+            if (el) {
+
+                return el;
+            }
+
+            await sleep(100);
+        }
+
+        return null;
+    }
+
+
+    // =========================================================
+    // CHỜ TRANG THỰC SỰ TẢI XONG (chủ động, không đoán thời
+    // gian cố định) - mạng lag nên cần kiểm tra kỹ trước khi
+    // thao tác, tránh bấm hụt/đọc nhầm dữ liệu cũ còn sót lại
+    // từ trang trước.
+    //
+    // Kiểm tra: document.readyState = 'complete' VÀ nội dung
+    // trang đã có chữ (không còn trống/màn hình trắng) VÀ giữ
+    // ổn định (không còn thay đổi độ dài) trong 1 khoảng ngắn
+    // liên tiếp - dấu hiệu Angular đã render xong, không phải
+    // đang render dở.
+    // =========================================================
+
+    async function waitForPageReady(timeoutMs) {
+
+        const start =
+            Date.now();
+
+        // SỬA LỖI: trước đây luôn bị giới hạn cứng ở 8 giây
+        // (Math.min với 8000) bất kể truyền vào bao nhiêu -
+        // đây là nguyên nhân chính khiến batch dừng sớm khi
+        // mạng lag. Giờ dùng ĐÚNG giá trị truyền vào.
+        const maxWait =
+            timeoutMs || 30000;
+
+        while (
+            Date.now() - start < maxWait
+        ) {
+
+            const bodyLength =
+                (document.body.innerText || '').length;
+
+            const domReady =
+                document.readyState === 'complete';
+
+            if (
+                domReady &&
+                bodyLength > 50
+            ) {
+
+                // Không đòi hỏi ổn định tuyệt đối nữa (dễ bị
+                // treo nếu trang có phần tử liên tục đổi nhẹ,
+                // VD đồng hồ/đếm giờ) - chỉ cần đã có nội dung
+                // + readyState xong, rồi đợi thêm 1 khoảng cố
+                // định ngắn cho Angular hoàn tất render.
+                await sleep(700);
+
+                return true;
+            }
+
+            await sleep(150);
+        }
+
+        warn(
+            'waitForPageReady: hết thời gian chờ, trang có ' +
+            'thể chưa tải xong hoàn toàn - vẫn tiếp tục.'
+        );
+
+        return false;
+    }
+
+
+    // -----------------------------------------------------------
+    // NẾU CHỜ QUÁ LÂU MÀ TRANG VẪN CHƯA TẢI XONG -> TỰ F5 LẠI
+    // (tối đa 3 lần liên tiếp, tránh vòng lặp F5 vô tận nếu
+    // trang thực sự bị lỗi/mất mạng hẳn). Trạng thái batch vẫn
+    // được giữ nguyên qua localStorage nên F5 xong script tự
+    // tiếp tục đúng chỗ.
+    // -----------------------------------------------------------
+
+    const STORAGE_RELOAD_COUNT_KEY =
+        'medinet_kl_m2_reload_count';
+
+    function getReloadCount() {
+
+        return parseInt(
+            localStorage.getItem(
+                STORAGE_RELOAD_COUNT_KEY
+            ) || '0',
+            10
+        );
+    }
+
+    function incReloadCount() {
+
+        localStorage.setItem(
+            STORAGE_RELOAD_COUNT_KEY,
+            String(
+                getReloadCount() + 1
+            )
+        );
+    }
+
+    function resetReloadCount() {
+
+        localStorage.removeItem(
+            STORAGE_RELOAD_COUNT_KEY
+        );
+    }
+
+    async function waitForPageReadyOrReload(
+        timeoutMs,
+        context
+    ) {
+
+        const ready =
+            await waitForPageReady(timeoutMs);
+
+        if (ready) {
+
+            resetReloadCount();
+
+            return true;
+        }
+
+        const reloadCount =
+            getReloadCount();
+
+        if (reloadCount >= 3) {
+
+            hideStatusBar();
+
+            setBatchActive(false);
+
+            resetReloadCount();
+
+            await infoModal(
+                '❌ Tải trang thất bại nhiều lần',
+                `<div>Đã thử F5 lại 3 lần nhưng trang vẫn ` +
+                `không tải xong${context ? ` (${context})` : ''}.</div>` +
+                '<div class="klm2-note">Vui lòng kiểm tra kết ' +
+                'nối mạng, rồi bấm lại "🚀 AUTO KL M2".</div>'
+            );
+
+            return false;
+        }
+
+        incReloadCount();
+
+        log(
+            `Trang tải quá lâu${context ? ` (${context})` : ''} ` +
+            `- tự F5 lại (lần ${reloadCount + 1}/3)...`
+        );
+
+        showStatusBar(
+            `Trang tải quá lâu - đang F5 lại (lần ${reloadCount + 1}/3)...`
+        );
+
+        await sleep(500);
+
+        location.reload();
+
+        // Trang sắp tải lại - không cần làm gì thêm, để hàm
+        // gọi không tiếp tục chạy tiếp với trang cũ dở dang
+        await new Promise(() => {});
+    }
+
+
+    // =========================================================
+    // NHẬN DIỆN TRANG HIỆN TẠI
+    // =========================================================
+
+    function isDanhSachPage() {
+
+        return (
+            location.href.includes(
+                'viewer-utility/KSKDK_DanhSach'
+            ) ||
+            norm(
+                document.body.innerText
+            ).includes(
+                'chất lượng dữ liệu'
+            )
+        );
+    }
+
+    function isKetLuanPage() {
+
+        return (
+            location.href.includes(
+                'KSKD18_KetLuanKham'
+            ) ||
+            norm(
+                document.body.innerText
+            ).includes(
+                'kết luận khám bệnh nhân dưới 18 tuổi'
+            )
+        );
+    }
+
+
+    // =========================================================
+    // TRANG DANH SÁCH: bấm bút chì dòng đầu tiên
+    // =========================================================
+
+    function findAllPencilLinks() {
+
+        const links = [
+            ...document.querySelectorAll(
+                'a[href="javascript:;"]'
+            )
+        ];
+
+        return links.filter(
+            a =>
+                a.querySelector('i.fa-pen')
+        );
+    }
+
+    function findPencilLinkAtSkipIndex() {
+
+        const links =
+            findAllPencilLinks();
+
+        const idx =
+            getSkipIndex();
+
+        return links[idx] || null;
+    }
+
+    async function goToFirstCase() {
+
+        showStatusBar(
+            'Đang chờ tải Danh sách...'
+        );
+
+        const readyList =
+            await waitForPageReadyOrReload(
+                40000,
+                'trang Danh sách'
+            );
+
+        if (!readyList) {
+
+            return;
+        }
+
+        updateStatusBar(
+            'Đang tìm ca tiếp theo...'
+        );
+
+        const link =
+            await waitForElement(
+                findPencilLinkAtSkipIndex,
+                30000
+            );
+
+        if (!link) {
+
+            hideStatusBar();
+
+            setBatchActive(false);
+
+            const skipped =
+                getSkippedList();
+
+            const skippedHtml =
+                skipped.length
+                    ? (
+                        '<div style="margin-top:10px;">' +
+                        `<b>${skipped.length} ca đã bỏ qua (cần xử lý tay):</b>` +
+                        '<ul style="margin:6px 0 0;padding-left:20px;">' +
+                        skipped.map(
+                            s =>
+                                `<li>${s.name} - ${s.reason}</li>`
+                        ).join('') +
+                        '</ul></div>'
+                    )
+                    : '';
+
+            await infoModal(
+                '✅ Hết ca dễ trong danh sách',
+                '<div>Không còn ca nào chưa xử lý ở vị trí ' +
+                'tiếp theo (có thể đã xử lý/bỏ qua hết các ca, ' +
+                'hoặc trang tải quá chậm).</div>' +
+                `<div class="klm2-note">Đã xử lý tự động: ${getBatchCount()} ca trong lần chạy này.</div>` +
+                skippedHtml
+            );
+
+            return;
+        }
+
+        log(
+            'Vào ca tiếp theo...'
+        );
+
+        updateStatusBar(
+            'Đang mở ca tiếp theo...'
+        );
+
+        const startUrl =
+            location.href;
+
+        robustClick(link);
+
+        await sleep(600);
+
+        if (
+            location.href === startUrl &&
+            !isKetLuanPage()
+        ) {
+
+            // Thử lại 1 lần với fastClick (dự phòng, phòng
+            // khi robustClick lại không hợp với thẻ <a> này)
+            fastClick(link);
+
+            await sleep(600);
+        }
+    }
+
+
+    // =========================================================
+    // TÌM VÀ BẤM "KẾT LUẬN" Ở SIDEBAR
+    //
+    // ⚠️ CHƯA CÓ HTML THẬT CỦA SIDEBAR - đoán theo cấu trúc
+    // phổ biến của các trang khác (leaf element khớp đúng chữ
+    // "Kết luận"). Nếu không bấm đúng, cần gửi HTML sidebar
+    // thật để chỉnh lại.
+    // =========================================================
+
+    function findKetLuanSidebarItem() {
+
+        // Xác nhận thật: DevExtreme TreeView, mỗi mục sidebar
+        // là 1 <li data-item-id="..."> - "Kết luận" luôn có
+        // đúng data-item-id="KSKD18_KetLuanKham" (khớp thẳng
+        // route URL) - CHẮC CHẮN hơn nhiều so với dò theo chữ.
+        return (
+            document.querySelector(
+                'li[data-item-id="KSKD18_KetLuanKham"]'
+            ) || null
+        );
+    }
+
+    async function goToKetLuanTab() {
+
+        showStatusBar(
+            'Đang chờ tải trang chi tiết...'
+        );
+
+        const readyDetail =
+            await waitForPageReadyOrReload(
+                40000,
+                'trang chi tiết'
+            );
+
+        if (!readyDetail) {
+
+            return;
+        }
+
+        updateStatusBar(
+            'Đang tìm mục "Kết luận"...'
+        );
+
+        const item =
+            await waitForElement(
+                findKetLuanSidebarItem,
+                30000
+            );
+
+        if (!item) {
+
+            hideStatusBar();
+
+            setBatchActive(false);
+
+            await infoModal(
+                '⚠️ Lỗi điều hướng',
+                '<div>Không tìm thấy mục "Kết luận" ở sidebar ' +
+                '(có thể trang tải quá chậm).</div>' +
+                '<div class="klm2-note">Nếu lặp lại nhiều lần, cần gửi HTML sidebar thật để sửa lại.</div>'
+            );
+
+            return;
+        }
+
+        log(
+            'Chuyển sang tab Kết luận...'
+        );
+
+        updateStatusBar(
+            'Đang mở tab Kết luận...'
+        );
+
+        // Cấu trúc thật: DevExtreme TreeView (<li
+        // data-item-id="..."> chứa .dx-treeview-item). Thử
+        // click nhiều cấp khác nhau bằng robustClick (đủ chuỗi
+        // sự kiện chuột - kiểu DevExtreme cần để cập nhật
+        // đúng state nội bộ, giống các dx-list-item khác đã
+        // gặp trong Auto M3/M4), và XÁC MINH thực sự đã chuyển
+        // trang chưa sau mỗi lần thử.
+        const candidates = [
+            item.querySelector('.dx-treeview-item'),
+            item,
+            item.querySelector('.dx-item-content'),
+            item.querySelector('span')
+        ].filter(Boolean);
+
+        const startUrl =
+            location.href;
+
+        for (const candidate of candidates) {
+
+            robustClick(candidate);
+
+            await sleep(600);
+
+            if (
+                location.href !== startUrl ||
+                isKetLuanPage()
+            ) {
+
+                log(
+                    'Đã chuyển sang tab Kết luận thành công.'
+                );
+
+                return;
+            }
+        }
+
+        warn(
+            'Đã thử click nhiều cách nhưng vẫn chưa chuyển ' +
+            'được sang tab Kết luận.'
+        );
+
+        hideStatusBar();
+
+        setBatchActive(false);
+
+        await infoModal(
+            '⚠️ Không chuyển được sang tab Kết luận',
+            '<div>Đã thử bấm nhiều cách nhưng trang không ' +
+            'chuyển. Có thể cấu trúc trang khác với dự đoán.</div>' +
+            '<div class="klm2-note">Vui lòng tự bấm "Kết luận" ' +
+            'bằng tay, rồi bấm lại nút "🚀 AUTO KL M2" khi đã ' +
+            'ở đúng trang Kết luận.</div>'
+        );
+    }
+
+
+    // =========================================================
+    // ĐỌC DỮ LIỆU TAB KẾT LUẬN
+    //
+    // Dựa đúng HTML thật đã xác nhận: 2 div có màu inline
+    // riêng biệt (#0b3c7d cho Tình trạng sức khỏe, #263238
+    // cho Bệnh/tật)
+    // =========================================================
+
+    function getTinhTrangSucKhoe() {
+
+        const el =
+            document.querySelector(
+                'div[style*="0b3c7d"]'
+            );
+
+        return (
+            el
+                ? el.textContent.trim()
+                : ''
+        );
+    }
+
+    // Đọc tên bệnh nhân (dùng để ghi vào danh sách các ca bị
+    // bỏ qua) - dò theo text "Họ tên:" trên trang, không cần
+    // biết trước cấu trúc HTML chính xác.
+    function getPatientName() {
+
+        const text =
+            document.body.innerText || '';
+
+        const match =
+            text.match(
+                /Họ tên:\s*([^\n]+)/i
+            );
+
+        return (
+            match
+                ? match[1].trim()
+                : '(không rõ tên)'
+        );
+    }
+
+    function getBenhTat() {
+
+        const el =
+            document.querySelector(
+                'div[style*="263238"]'
+            );
+
+        return (
+            el
+                ? el.textContent.trim()
+                : ''
+        );
+    }
+
+
+    // =========================================================
+    // BẢNG NHÓM MÃ ICD -> CHUYÊN KHOA (tra + suy đoán theo
+    // chương ICD-10 chuẩn - CHỈ mang tính tham khảo, cần rà
+    // soát lại theo thực tế)
+    // =========================================================
+
+    const ICD_SPECIALTY_MAP = [
+        { test: c => /^K(0[0-9]|1[0-4])/.test(c), text: 'Khám Răng' },
+        { test: c => /^H([0-4][0-9]|5[0-9])/.test(c), text: 'Khám Mắt' },
+        { test: c => /^H([6-9][0-9])/.test(c), text: 'Khám Tai Mũi Họng' },
+        { test: c => /^J[0-9]{2}/.test(c), text: 'Khám Hô hấp' },
+        { test: c => /^I[0-9]{2}/.test(c), text: 'Khám Tim mạch' },
+        { test: c => /^K(2[0-9]|[3-9][0-9])/.test(c), text: 'Khám Tiêu hóa' },
+        { test: c => /^L[0-9]{2}/.test(c), text: 'Khám Da liễu' },
+        { test: c => /^M[0-9]{2}/.test(c), text: 'Khám Cơ Xương Khớp' },
+        { test: c => /^N([0-3][0-9])/.test(c), text: 'Khám Thận - Tiết niệu' },
+        { test: c => /^N([4-9][0-9])/.test(c), text: 'Khám chuyên khoa' },
+        { test: c => /^E[0-9]{2}/.test(c), text: 'Khám Nội tiết' },
+        { test: c => /^F[0-9]{2}/.test(c), text: 'Khám Tâm thần' },
+        { test: c => /^G[0-9]{2}/.test(c), text: 'Khám Thần kinh' },
+        { test: c => /^D([5-8][0-9])/.test(c), text: 'Khám Huyết học' }
+    ];
+
+    // Nhóm NGUY HIỂM/CẦN BÁC SĨ QUYẾT ĐỊNH - không tự đoán
+    const ICD_STOP_GROUPS = [
+        {
+            test: c => /^C[0-9]{2}/.test(c) || /^D([0-4][0-9])/.test(c),
+            reason: 'nhóm u bướu (C00-D48)'
+        },
+        {
+            test: c => /^[ST][0-9]{2}/.test(c),
+            reason: 'nhóm chấn thương (S00-T98)'
+        }
+    ];
+
+    function extractIcdCodes(text) {
+
+        const matches = [
+            ...(text || '').matchAll(
+                /\(([A-Z]\d{2}(?:\.\d+)?)\)/g
+            )
+        ];
+
+        return matches.map(
+            m => m[1]
+        );
+    }
+
+    function classifyBenhTat(benhTatText) {
+
+        const trimmed =
+            (benhTatText || '').trim();
+
+        if (
+            !trimmed ||
+            norm(trimmed) === 'không có'
+        ) {
+
+            return { type: 'normal' };
+        }
+
+        const codes =
+            extractIcdCodes(trimmed);
+
+        if (!codes.length) {
+
+            return {
+                type: 'unknown',
+                reason: `Không nhận diện được mã ICD trong nội dung: "${trimmed}"`
+            };
+        }
+
+        for (const code of codes) {
+
+            const stopMatch =
+                ICD_STOP_GROUPS.find(
+                    g => g.test(code)
+                );
+
+            if (stopMatch) {
+
+                return {
+                    type: 'stop',
+                    reason: `Mã ${code} thuộc ${stopMatch.reason} - cần bác sĩ quyết định`
+                };
+            }
+        }
+
+        const specialties =
+            new Set();
+
+        const unmatched =
+            [];
+
+        for (const code of codes) {
+
+            const match =
+                ICD_SPECIALTY_MAP.find(
+                    g => g.test(code)
+                );
+
+            if (match) {
+
+                specialties.add(
+                    match.text
+                );
+
+            } else {
+
+                unmatched.push(code);
+            }
+        }
+
+        if (unmatched.length) {
+
+            return {
+                type: 'unknown',
+                reason: `Không nhận diện được nhóm cho mã: ${unmatched.join(', ')}`
+            };
+        }
+
+        return {
+            type: 'specialty',
+            text: [...specialties].join(', ')
+        };
+    }
+
+
+    // =========================================================
+    // CHỌN LỰA CHỌN TRONG "3. ĐỀ NGHỊ" (dx-list dạng chọn 1,
+    // style giống ô vuông nhưng thực chất là role="radio" bên
+    // trong mỗi .dx-list-item - ĐÃ XÁC NHẬN qua HTML thật, y
+    // hệt kiểu 22 câu Tiền sử / D-code trong Auto M3/M4)
+    // =========================================================
+
+    function findLabelsByExactText(targetText) {
+
+        const target =
+            norm(targetText);
+
+        return [
+            ...document.querySelectorAll('b')
+        ].filter(
+            b =>
+                norm(b.textContent)
+                    .replace(/\*\s*$/, '')
+                    .trim() === target
+        );
+    }
+
+    function findDeNghiListItem(labelText) {
+
+        const target =
+            norm(labelText);
+
+        const items = [
+            ...document.querySelectorAll(
+                '.dx-item.dx-list-item[role="option"]'
+            )
+        ];
+
+        return (
+            items.find(
+                item => {
+
+                    const content =
+                        item.querySelector(
+                            '.dx-item-content.dx-list-item-content'
+                        ) ||
+                        item.querySelector(
+                            '.dx-item-content'
+                        );
+
+                    return (
+                        content &&
+                        norm(content.textContent) === target
+                    );
+                }
+            ) || null
+        );
+    }
+
+    function isDeNghiItemSelected(item) {
+
+        if (!item) {
+
+            return false;
+        }
+
+        if (
+            item.getAttribute('aria-selected') === 'true'
+        ) {
+
+            return true;
+        }
+
+        if (
+            item.classList.contains('dx-list-item-selected')
+        ) {
+
+            return true;
+        }
+
+        const radio =
+            item.querySelector('[role="radio"]');
+
+        return (
+            !!radio &&
+            radio.getAttribute('aria-checked') === 'true'
+        );
+    }
+
+    async function checkCheckboxByLabel(labelText) {
+
+        // Chờ CHỦ ĐỘNG tới khi thấy đúng lựa chọn xuất hiện
+        // (tối đa 10s) - vì bảng "3. Đề nghị" là dx-list, có
+        // thể render trễ hơn phần còn lại của trang, đặc biệt
+        // khi mạng lag.
+        const item =
+            await waitForElement(
+                () => findDeNghiListItem(labelText),
+                25000
+            );
+
+        if (!item) {
+
+            warn(
+                'Không tìm thấy lựa chọn "Đề nghị":',
+                labelText
+            );
+
+            return false;
+        }
+
+        if (
+            isDeNghiItemSelected(item)
+        ) {
+
+            return true;
+        }
+
+        // Thử NHIỀU điểm click khác nhau qua từng lần (không
+        // lặp lại đúng 1 điểm) - vì DevExtreme dx-list có thể
+        // cần click trúng đúng phần radio icon bên trong, không
+        // phải click vào đâu trên hàng cũng nhận.
+        const radio =
+            item.querySelector('[role="radio"]') ||
+            item.querySelector('.dx-list-select-radiobutton');
+
+        const contentEl =
+            item.querySelector('.dx-item-content');
+
+        const clickTargets = [
+            item,
+            radio,
+            contentEl
+        ].filter(Boolean);
+
+        for (
+            let attempt = 0;
+            attempt < clickTargets.length;
+            attempt++
+        ) {
+
+            robustClick(
+                clickTargets[attempt]
+            );
+
+            await sleep(400);
+
+            if (
+                isDeNghiItemSelected(item)
+            ) {
+
+                return true;
+            }
+
+            warn(
+                `Lựa chọn "${labelText}" chưa chọn được sau ` +
+                `lần bấm ${attempt + 1}/${clickTargets.length} ` +
+                '(khác điểm click), thử lại...'
+            );
+        }
+
+        warn(
+            `⚠️ KHÔNG chọn được "${labelText}" sau ${clickTargets.length} lần thử.`
+        );
+
+        return false;
+    }
+
+
+    // =========================================================
+    // ĐIỀN Ô "ĐỀ NGHỊ (GHI RÕ)"
+    //
+    // ⚠️ CHƯA CÓ HTML THẬT của ô này - đoán là textarea hoặc
+    // ô DevExtreme text thường. Có cơ chế dự phòng (lấy
+    // textarea đầu tiên trên trang) nếu không tìm theo nhãn.
+    // =========================================================
+
+    const nativeInputValueSetter =
+        Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype,
+            'value'
+        ).set;
+
+    const nativeTextareaValueSetter =
+        Object.getOwnPropertyDescriptor(
+            window.HTMLTextAreaElement.prototype,
+            'value'
+        ).set;
+
+    async function dispatchElementValue(el, displayVal) {
+
+        el.focus();
+
+        const isContentEditable =
+            el.isContentEditable ||
+            el.getAttribute('contenteditable') === 'true';
+
+        if (isContentEditable) {
+
+            el.textContent = displayVal;
+
+        } else if (el.tagName === 'TEXTAREA') {
+
+            nativeTextareaValueSetter.call(
+                el,
+                displayVal
+            );
+
+        } else {
+
+            nativeInputValueSetter.call(
+                el,
+                displayVal
+            );
+        }
+
+        el.dispatchEvent(
+            new Event('input', { bubbles: true })
+        );
+
+        el.dispatchEvent(
+            new KeyboardEvent('keyup', { bubbles: true })
+        );
+
+        el.dispatchEvent(
+            new Event('change', { bubbles: true })
+        );
+
+        el.blur();
+
+        el.dispatchEvent(
+            new Event('blur', { bubbles: true })
+        );
+
+        el.dispatchEvent(
+            new FocusEvent('focusout', { bubbles: true })
+        );
+    }
+
+    function findDeNghiGhiRoInput() {
+
+        const labels =
+            findLabelsByExactText('Đề nghị ( ghi rõ)')
+                .concat(
+                    findLabelsByExactText('Đề nghị (ghi rõ)')
+                );
+
+        const selector =
+            'textarea, input.dx-texteditor-input, ' +
+            '[contenteditable="true"]';
+
+        for (const label of labels) {
+
+            let current = label;
+
+            for (let level = 0; level < 12; level++) {
+
+                if (!current) {
+                    break;
+                }
+
+                const input =
+                    current.querySelector(selector);
+
+                if (input) {
+
+                    return input;
+                }
+
+                current =
+                    current.parentElement;
+            }
+        }
+
+        // Dự phòng: nhãn tìm được nhưng leo cha không ra ô
+        // nhập - tìm phần tử input/textarea/contenteditable
+        // ĐẦU TIÊN xuất hiện SAU nhãn theo thứ tự DOM (không
+        // phụ thuộc quan hệ cha-con)
+        if (labels.length) {
+
+            const label = labels[0];
+
+            const allCandidates = [
+                ...document.querySelectorAll(selector)
+            ];
+
+            const afterLabel =
+                allCandidates.find(
+                    el => {
+
+                        const pos =
+                            label.compareDocumentPosition(el);
+
+                        return (
+                            !!(
+                                pos &
+                                Node.DOCUMENT_POSITION_FOLLOWING
+                            )
+                        );
+                    }
+                );
+
+            if (afterLabel) {
+
+                return afterLabel;
+            }
+        }
+
+        // Dự phòng cuối: textarea đầu tiên trên trang
+        const textareas = [
+            ...document.querySelectorAll('textarea')
+        ];
+
+        return textareas[0] || null;
+    }
+
+    async function fillDeNghiGhiRo(text) {
+
+        // Chờ chủ động ô này xuất hiện (tối đa 8s)
+        const input =
+            await waitForElement(
+                findDeNghiGhiRoInput,
+                20000
+            );
+
+        if (!input) {
+
+            warn(
+                'Không tìm thấy ô "Đề nghị (ghi rõ)"'
+            );
+
+            return false;
+        }
+
+        await dispatchElementValue(input, text);
+
+        await sleep(300);
+
+        // Kiểm tra lại đã điền vào thật chưa
+        const actualValue =
+            (
+                input.value !== undefined
+                    ? input.value
+                    : input.textContent
+            ) || '';
+
+        if (
+            !norm(actualValue).includes(norm(text))
+        ) {
+
+            warn(
+                `Điền "Đề nghị (ghi rõ)" chưa chắc thành công ` +
+                `(mong đợi "${text}", hiện thấy "${actualValue}")`
+            );
+
+            return false;
+        }
+
+        return true;
+    }
+
+
+    // =========================================================
+    // NÚT "LƯU THAY ĐỔI" / "QUAY LẠI"
+    // =========================================================
+
+    function findButtonByText(text) {
+
+        const target =
+            norm(text);
+
+        // DevExtreme dxButton thường render là <div
+        // role="button"> hoặc <div class="dx-button">, KHÔNG
+        // phải thẻ <button> thật - phải tìm rộng hơn.
+        const buttons = [
+            ...document.querySelectorAll(
+                'button, a, div[role="button"], ' +
+                'span[role="button"], .dx-button'
+            )
+        ];
+
+        return (
+            buttons.find(
+                b => norm(b.textContent).includes(target)
+            ) || null
+        );
+    }
+
+    async function clickLuu() {
+
+        updateStatusBar(
+            'Đang lưu...'
+        );
+
+        const btn =
+            await waitForElement(
+                () => findButtonByText('lưu thay đổi'),
+                20000
+            );
+
+        if (!btn) {
+
+            warn('Không tìm thấy nút Lưu thay đổi');
+
+            return false;
+        }
+
+        fastClick(btn);
+
+        // Mạng lag - đợi lâu hơn cho chắc lưu thành công
+        await sleep(1500);
+
+        return true;
+    }
+
+    async function clickQuayLai() {
+
+        updateStatusBar(
+            'Đang quay lại danh sách...'
+        );
+
+        const btn =
+            await waitForElement(
+                () => findButtonByText('quay lại'),
+                20000
+            );
+
+        if (!btn) {
+
+            warn('Không tìm thấy nút Quay lại');
+
+            return false;
+        }
+
+        fastClick(btn);
+
+        return true;
+    }
+
+
+    // =========================================================
+    // XỬ LÝ 1 CA Ở TAB KẾT LUẬN
+    // =========================================================
+
+    // -----------------------------------------------------------
+    // BỎ QUA CA HIỆN TẠI (quá khó, chưa hỗ trợ tự động) - KHÔNG
+    // lưu gì cả, chỉ ghi nhận lại rồi quay về danh sách và TIẾP
+    // TỤC batch với ca kế tiếp, thay vì dừng hẳn toàn bộ.
+    // -----------------------------------------------------------
+
+    async function skipCurrentCase(reason) {
+
+        const name =
+            getPatientName();
+
+        log(
+            `⏭️ Bỏ qua ca "${name}": ${reason}`
+        );
+
+        addToSkippedList({
+            name,
+            reason
+        });
+
+        incSkipIndex();
+
+        showToast(
+            `⏭️ Bỏ qua "${name}" (${reason}) - đang qua ca tiếp theo...`,
+            3500
+        );
+
+        await sleep(400);
+
+        await clickQuayLai();
+    }
+
+    async function processKetLuanCase() {
+
+        showStatusBar(
+            'Đang chờ tải tab Kết luận...'
+        );
+
+        const readyKetLuan =
+            await waitForPageReadyOrReload(
+                40000,
+                'tab Kết luận'
+            );
+
+        if (!readyKetLuan) {
+
+            return;
+        }
+
+        // Chờ thêm tới khi bảng "3. Đề nghị" (dx-list) thực sự
+        // render xong trong DOM - widget này thường tải chậm
+        // hơn phần còn lại, đặc biệt khi mạng lag.
+        await waitForElement(
+            () => findDeNghiListItem('Khác'),
+            25000
+        );
+
+        await sleep(500);
+
+        updateStatusBar(
+            'Đang đọc thông tin ca khám...'
+        );
+
+        const tinhTrang =
+            getTinhTrangSucKhoe();
+
+        const benhTat =
+            getBenhTat();
+
+        const tinhTrangNorm =
+            norm(tinhTrang);
+
+        log(
+            'Tình trạng sức khỏe:',
+            tinhTrang,
+            '| Bệnh tật:',
+            benhTat
+        );
+
+        // -----------------------------------------------------
+        // TRƯỜNG HỢP MỚI: Phân loại sức khỏe TRỐNG (chưa đọc
+        // được giá trị nào cả) -> chọn "Khác" rồi lưu luôn,
+        // không cần điền chữ gì thêm vào ô ghi rõ.
+        // -----------------------------------------------------
+
+        if (!tinhTrangNorm) {
+
+            log(
+                'Phân loại sức khỏe trống -> chọn "Khác" và lưu.'
+            );
+
+            updateStatusBar(
+                'Phân loại trống - đang chọn "Khác"...'
+            );
+
+            const blankSelectionOk =
+                await checkCheckboxByLabel('Khác');
+
+            if (!blankSelectionOk) {
+
+                hideStatusBar();
+
+                setBatchActive(false);
+
+                await infoModal(
+                    '❌ Dừng lại - chưa chọn được',
+                    '<div>Script không tự tích được checkbox ' +
+                    '"Khác" cho ca có Phân loại sức khỏe trống.</div>' +
+                    '<div class="klm2-note">KHÔNG tự lưu để tránh ' +
+                    'lưu sai. Vui lòng xử lý tay ca này.</div>',
+                    'warn'
+                );
+
+                return;
+            }
+
+            const savedOkBlank =
+                await clickLuu();
+
+            if (!savedOkBlank) {
+
+                hideStatusBar();
+
+                setBatchActive(false);
+
+                await infoModal(
+                    '❌ Lỗi lưu',
+                    '<div>Không bấm được nút "Lưu thay đổi" ' +
+                    '(ca có Phân loại sức khỏe trống). Kiểm tra thủ công.</div>'
+                );
+
+                return;
+            }
+
+            incBatchCount();
+
+            showToast(
+                `✓ Đã xử lý ca #${getBatchCount()} (Phân loại trống), đang qua ca tiếp theo...`
+            );
+
+            await sleep(300);
+
+            await clickQuayLai();
+
+            return;
+        }
+
+        // Không còn phân biệt Loại I/II/III/IV/V nữa - TẤT CẢ
+        // các mức đều xử lý GIỐNG NHAU, chỉ dựa vào "Bệnh, tật"
+        // (mã ICD) để quyết định. Chỉ coi là "khó" khi mã ICD
+        // không nằm trong danh mục nhận diện được, hoặc thuộc
+        // nhóm nguy hiểm (xử lý ở bước classifyBenhTat bên dưới)
+        if (
+            ![
+                'loại i', 'loại ii', 'loại iii',
+                'loại iv', 'loại v'
+            ].includes(tinhTrangNorm)
+        ) {
+
+            hideStatusBar();
+
+            await skipCurrentCase(
+                `Không đọc được Tình trạng sức khỏe ("${tinhTrang}")`
+            );
+
+            return;
+        }
+
+        updateStatusBar(
+            'Đang xác định Đề nghị phù hợp...'
+        );
+
+        const classification =
+            classifyBenhTat(benhTat);
+
+        let selectionOk = true;
+
+        if (classification.type === 'normal') {
+
+            updateStatusBar(
+                'Đang chọn "Bình thường..."'
+            );
+
+            selectionOk =
+                await checkCheckboxByLabel(
+                    'Bình thường, hẹn khám định kỳ lần sau'
+                );
+
+        } else if (classification.type === 'specialty') {
+
+            updateStatusBar(
+                'Đang chọn "Khác" và điền chuyên khoa...'
+            );
+
+            selectionOk =
+                await checkCheckboxByLabel('Khác');
+
+            if (selectionOk) {
+
+                const filledOk =
+                    await fillDeNghiGhiRo(
+                        classification.text
+                    );
+
+                selectionOk =
+                    selectionOk && filledOk;
+            }
+
+        } else {
+
+            hideStatusBar();
+
+            await skipCurrentCase(
+                classification.reason
+            );
+
+            return;
+        }
+
+        // -----------------------------------------------------
+        // CHỈ Lưu nếu chọn/điền THÀNH CÔNG thật sự (đã kiểm
+        // tra lại, không phải chỉ "đã bấm"). Trước đây có lỗi
+        // vẫn lưu dù chưa chọn được gì - rất nguy hiểm.
+        // -----------------------------------------------------
+
+        if (!selectionOk) {
+
+            hideStatusBar();
+
+            setBatchActive(false);
+
+            await infoModal(
+                '❌ Dừng lại - chưa chọn/điền được',
+                '<div>Script không tự tích được checkbox hoặc ' +
+                'điền được ô "Đề nghị (ghi rõ)" cho ca này.</div>' +
+                '<div class="klm2-note">KHÔNG tự lưu để tránh ' +
+                'lưu sai. Vui lòng kiểm tra/xử lý tay ca này, ' +
+                'rồi báo lại để mình sửa script.</div>',
+                'warn'
+            );
+
+            return;
+        }
+
+        const savedOk =
+            await clickLuu();
+
+        if (!savedOk) {
+
+            hideStatusBar();
+
+            setBatchActive(false);
+
+            await infoModal(
+                '❌ Lỗi lưu',
+                '<div>Không bấm được nút "Lưu thay đổi". Kiểm tra thủ công.</div>'
+            );
+
+            return;
+        }
+
+        incBatchCount();
+
+        showToast(
+            `✓ Đã xử lý ca #${getBatchCount()}, đang qua ca tiếp theo...`
+        );
+
+        await sleep(300);
+
+        await clickQuayLai();
+    }
+
+
+    // =========================================================
+    // NÚT ĐIỀU KHIỂN: BẮT ĐẦU / DỪNG
+    // =========================================================
+
+    function createControlButtons() {
+
+        if (
+            document.getElementById('klm2-start-btn')
+        ) {
+
+            return;
+        }
+
+        const startBtn =
+            document.createElement('button');
+
+        startBtn.id = 'klm2-start-btn';
+
+        startBtn.className = 'klm2-toolbar-btn';
+
+        startBtn.innerText =
+            isBatchActive()
+                ? '⏳ Đang chạy KL M2...'
+                : '🚀 AUTO KL M2';
+
+        Object.assign(
+            startBtn.style,
+            {
+                position: 'fixed',
+                right: '20px',
+                bottom: '420px',
+                zIndex: '999999',
+                padding: '8px 14px',
+                background: '#d97706',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '999px',
+                fontSize: '13px',
+                fontWeight: 'bold',
+                cursor: 'pointer',
+                boxShadow: '0 3px 10px rgba(0,0,0,.3)'
+            }
+        );
+
+        const stopBtn =
+            document.createElement('button');
+
+        stopBtn.id = 'klm2-stop-btn';
+
+        stopBtn.className = 'klm2-toolbar-btn';
+
+        stopBtn.innerText = '⏹ DỪNG KL M2';
+
+        Object.assign(
+            stopBtn.style,
+            {
+                position: 'fixed',
+                right: '20px',
+                bottom: '465px',
+                zIndex: '999999',
+                padding: '8px 14px',
+                background: '#dc2626',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '999px',
+                fontSize: '13px',
+                fontWeight: 'bold',
+                cursor: 'pointer',
+                boxShadow: '0 3px 10px rgba(0,0,0,.3)',
+                display: isBatchActive() ? 'block' : 'none'
+            }
+        );
+
+        startBtn.addEventListener(
+            'click',
+            async () => {
+
+                const confirmed =
+                    await confirmModal(
+                        '🚀 Bắt đầu Auto KL M2',
+                        '<div>Script sẽ tự động chạy qua từng ca trong ' +
+                        'danh sách "chưa kết luận" - chỉ tự xử lý ca ' +
+                        '<b>Loại I/II không bệnh</b> hoặc <b>có bệnh ' +
+                        'rõ chuyên khoa</b>. Gặp ca khó (Loại III/IV/V, ' +
+                        'bệnh nguy hiểm, mã lạ) sẽ tự DỪNG và báo bạn.</div>' +
+                        '<div class="klm2-note">⚠️ Script sẽ tự LƯU thật ' +
+                        '(bấm "Lưu thay đổi" tự động) - hãy theo dõi kỹ ' +
+                        'trong vài ca đầu để chắc chắn hoạt động đúng.</div>'
+                    );
+
+                if (!confirmed) {
+
+                    return;
+                }
+
+                resetBatchCount();
+
+                resetSkipIndex();
+
+                resetReloadCount();
+
+                resetSkippedList();
+
+                setBatchActive(true);
+
+                stopBtn.style.display = 'block';
+
+                startBtn.innerText =
+                    '⏳ Đang chạy KL M2...';
+
+                // Dùng chung logic nhận diện trang với
+                // continueBatchFlow() - cho phép bắt đầu từ
+                // BẤT KỲ trang nào (Danh sách, Kết luận đang
+                // xem sẵn, hoặc trang chi tiết trung gian)
+                await runBatchStepSafely();
+            }
+        );
+
+        stopBtn.addEventListener(
+            'click',
+            () => {
+
+                setBatchActive(false);
+
+                stopBtn.style.display = 'none';
+
+                startBtn.innerText =
+                    '🚀 AUTO KL M2';
+
+                showToast(
+                    '⏹ Đã dừng Auto KL M2.'
+                );
+            }
+        );
+
+        document.body.appendChild(startBtn);
+
+        document.body.appendChild(stopBtn);
+    }
+
+
+    // =========================================================
+    // KHỞI ĐỘNG: nếu batch đang chạy, tự tiếp tục theo đúng
+    // bước (Danh sách -> Chi tiết -> Kết luận -> xử lý -> Lưu
+    // -> Quay lại -> Danh sách...)
+    // =========================================================
+
+    async function continueBatchFlow() {
+
+        if (!isBatchActive()) {
+
+            log(
+                'Batch không active, chờ người dùng bấm nút.'
+            );
+
+            return;
+        }
+
+        log(
+            'Batch đang active, tự tiếp tục...'
+        );
+
+        showStatusBar(
+            'Đang xác định trang hiện tại...'
+        );
+
+        const readyContinue =
+            await waitForPageReadyOrReload(
+                40000,
+                'xác định trang hiện tại'
+            );
+
+        if (!readyContinue) {
+
+            return;
+        }
+
+        if (isKetLuanPage()) {
+
+            await processKetLuanCase();
+
+        } else if (isDanhSachPage()) {
+
+            await goToFirstCase();
+
+        } else {
+
+            // Trang chi tiết khác (Thông tin hành chính...)
+            // -> tìm và bấm "Kết luận" ở sidebar
+            await goToKetLuanTab();
+        }
+    }
+
+
+    // =========================================================
+    // THEO DÕI ĐIỀU HƯỚNG SPA (Angular đổi trang KHÔNG tải lại
+    // trang thật) - vì phát hiện thực tế: bấm bút chì trong
+    // Danh sách chỉ đổi URL nội bộ (pushState), KHÔNG có sự
+    // kiện tải trang thật để userscript tự chạy lại. Nên phải
+    // tự bắt sự kiện đổi URL (pushState/replaceState/popstate)
+    // rồi CHỦ ĐỘNG chạy lại logic batch mỗi khi phát hiện đổi
+    // trang, thay vì chỉ trông chờ vào document-idle 1 lần.
+    // =========================================================
+
+    let isBatchBusy =
+        false;
+
+    async function runBatchStepSafely() {
+
+        if (isBatchBusy) {
+
+            log(
+                'Đang bận xử lý bước trước, bỏ qua lần gọi này.'
+            );
+
+            return;
+        }
+
+        isBatchBusy = true;
+
+        try {
+
+            await continueBatchFlow();
+
+        } catch (e) {
+
+            console.error(LOG, e);
+
+            hideStatusBar();
+
+            setBatchActive(false);
+
+            await infoModal(
+                '❌ Lỗi script - đã dừng batch',
+                `<div>${(e && e.message) || String(e)}</div>` +
+                '<div class="klm2-note">Mở Console (F12) xem chi tiết lỗi. ' +
+                'Gửi lại nội dung lỗi này để mình sửa.</div>',
+                'warn'
+            );
+
+        } finally {
+
+            isBatchBusy = false;
+        }
+    }
+
+    async function onRouteChange() {
+
+        if (isBatchBusy) {
+
+            return;
+        }
+
+        if (!isBatchActive()) {
+
+            return;
+        }
+
+        log(
+            'Phát hiện đổi trang (URL:',
+            location.href,
+            ') - tự tiếp tục batch...'
+        );
+
+        // Đợi Angular bắt đầu render nội dung route mới trước
+        // khi kiểm tra, tránh đọc nhầm nội dung cũ
+        await sleep(400);
+
+        await runBatchStepSafely();
+    }
+
+    function installSpaNavigationWatcher() {
+
+        if (
+            window.__klm2NavWatcherInstalled
+        ) {
+
+            return;
+        }
+
+        window.__klm2NavWatcherInstalled = true;
+
+        const originalPushState =
+            history.pushState;
+
+        const originalReplaceState =
+            history.replaceState;
+
+        history.pushState = function (...args) {
+
+            const result =
+                originalPushState.apply(
+                    this,
+                    args
+                );
+
+            window.dispatchEvent(
+                new Event('klm2-locationchange')
+            );
+
+            return result;
+        };
+
+        history.replaceState = function (...args) {
+
+            const result =
+                originalReplaceState.apply(
+                    this,
+                    args
+                );
+
+            window.dispatchEvent(
+                new Event('klm2-locationchange')
+            );
+
+            return result;
+        };
+
+        window.addEventListener(
+            'popstate',
+            () => {
+
+                window.dispatchEvent(
+                    new Event('klm2-locationchange')
+                );
+            }
+        );
+
+        window.addEventListener(
+            'klm2-locationchange',
+            onRouteChange
+        );
+
+        // -------------------------------------------------
+        // DỰ PHÒNG CHẮC ĂN: polling kiểm tra URL định kỳ,
+        // KHÔNG phụ thuộc vào việc hook pushState/replaceState
+        // có bắt được hay không - vì Angular (zone.js) có thể
+        // đã tự bọc history API từ trước khi script này chạy,
+        // khiến hook ở trên bị "qua mặt" (gọi thẳng bản gốc,
+        // không qua bản đã ghi đè của mình). Polling luôn bắt
+        // được thay đổi URL bất kể cơ chế nào gây ra.
+        // -------------------------------------------------
+
+        let lastKnownUrl =
+            location.href;
+
+        setInterval(
+            () => {
+
+                // QUAN TRỌNG: chỉ đánh dấu "đã thấy URL này"
+                // khi KHÔNG bận (isBatchBusy = false). Nếu
+                // đang bận mà vẫn đánh dấu, tín hiệu đổi URL
+                // đó sẽ MẤT VĨNH VIỄN (vì lần sau URL không
+                // còn khác lastKnownUrl nữa) - đây chính là
+                // bug gây treo ở bản trước.
+                if (
+                    location.href !== lastKnownUrl &&
+                    !isBatchBusy
+                ) {
+
+                    lastKnownUrl =
+                        location.href;
+
+                    log(
+                        'Polling phát hiện đổi URL:',
+                        lastKnownUrl
+                    );
+
+                    onRouteChange();
+                }
+            },
+            500
+        );
+
+        log(
+            'Đã cài đặt theo dõi điều hướng SPA.'
+        );
+    }
+
+
+    async function init() {
+
+        createControlButtons();
+
+        installSpaNavigationWatcher();
+
+        await runBatchStepSafely();
+    }
+
+    init();
+
+})();
